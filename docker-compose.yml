@@ -1,0 +1,19 @@
+services:
+  ocr:
+    build: .
+    container_name: milady-ocr
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+    environment:
+      - API_KEY=${API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - DB_PATH=/data/ocr.db
+      - UPLOAD_DIR=/data/uploads
+      - OCR_MODEL=${OCR_MODEL:-gpt-4o-mini}
+      - OCR_CONFIDENCE_THRESHOLD=${OCR_CONFIDENCE_THRESHOLD:-0.85}
+      - MILADY_WEBHOOK_URL=${MILADY_WEBHOOK_URL}
+      - MILADY_WEBHOOK_KEY=${MILADY_WEBHOOK_KEY}
+      - EMAIL_WEBHOOK_SECRET=${EMAIL_WEBHOOK_SECRET}
