@@ -141,6 +141,34 @@ Tests do **not** call OpenAI, do **not** require Poppler, and do **not** depend 
 
 - [BL → clôture → facture (Pôle Embal, mai 2026)](docs/workflows/bl-cloture-facture-pole-embal-2026-05.md) — COM-611 scoping document mapping a 12-page Pôle Embal / ARGEPER PDF to candidate OCR fields and Milady columns. The source PDF is vault-only and image-only (no embedded text); the doc frames the future multi-page / multi-role OCR pipeline but does not change runtime behavior.
 
+## Docs-only QA / staging note
+
+Some tickets in this repo (COM-611 in particular) are **documentation /
+scoping handoffs only**: they add or update files under `docs/` and/or this
+README, and intentionally do **not** touch `src/`, endpoints, schemas, or
+runtime behavior. For those handoffs:
+
+- There is no new or changed HTTP endpoint, UI surface, or background worker
+  to exercise. `git diff` against the ticket's base commit is the source of
+  truth for what changed.
+- This repository currently has **no configured staging URL / deploy
+  identity verifier**. The sidecar runs on a small operator-managed VPS in
+  real deployment (see top of README), but no staging environment is wired up
+  for docs-only handoffs and none should be expected by the QA verifier for a
+  ticket whose diff is confined to `README.md` / `docs/`.
+- The source PDFs referenced by the workflow docs (e.g. the Pôle Embal /
+  ARGEPER bundle for COM-611) are **vault-only client evidence** and must
+  never be checked into git. QA cannot expect to retrieve them from this
+  repo.
+- QA should verify a docs-only handoff by (a) reading the committed
+  docs/README diff, (b) confirming the commit message references the Linear
+  ticket, and (c) running `PYTHONPATH=src python3 -m pytest tests/` to
+  confirm no regression — not by chasing a staging URL or browser route.
+
+Tickets that actually change `src/` (e.g. COM-606) still ship with unit tests
+under `tests/` as the verifier; the absence of a staging URL applies
+specifically to docs-only handoffs.
+
 ## Calibration limitation (COM-606)
 
 This checkout intentionally ships **without** anonymized Mercalys order samples. The prompt was authored from the field spec in the COM-606 ticket and post-meeting notes. Real prompt calibration — adjusting the system prompt, confidence thresholds, and per-field warning heuristics against 20–50 anonymized Mercalys PDFs — must happen in a subsequent pass, once Julien has assembled and anonymized the sample set. The unit tests cover parsing/persistence/matching behavior, not OCR accuracy.
