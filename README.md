@@ -115,6 +115,10 @@ PYTHONPATH=src python3 -m pytest tests/
 
 Tests do **not** call OpenAI, do **not** require Poppler, and do **not** depend on real Mercalys PDFs. The vision call and the PDF→image step are monkeypatched.
 
+## Reference workflows
+
+- [BL → clôture → facture (Pôle Embal, mai 2026)](docs/workflows/bl-cloture-facture-pole-embal-2026-05.md) — COM-611 scoping document mapping a 12-page Pôle Embal / ARGEPER PDF to candidate OCR fields and Milady columns. The source PDF is vault-only and image-only (no embedded text); the doc frames the future multi-page / multi-role OCR pipeline but does not change runtime behavior.
+
 ## Calibration limitation (COM-606)
 
 This checkout intentionally ships **without** anonymized Mercalys order samples. The prompt was authored from the field spec in the COM-606 ticket and post-meeting notes. Real prompt calibration — adjusting the system prompt, confidence thresholds, and per-field warning heuristics against 20–50 anonymized Mercalys PDFs — must happen in a subsequent pass, once Julien has assembled and anonymized the sample set. The unit tests cover parsing/persistence/matching behavior, not OCR accuracy.
