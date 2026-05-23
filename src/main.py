@@ -2,7 +2,7 @@ import os
 import asyncio
 from pathlib import Path
 from contextlib import asynccontextmanager
-from typing import Union
+from typing import Optional, Union
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Header, Query, Request
 from fastapi.responses import JSONResponse
@@ -16,6 +16,9 @@ from models import (
     JobsPendingResponse,
     OcrJob,
     OcrResult,
+    SupplierCandidate,
+    SuppliersSyncRequest,
+    SuppliersSyncResponse,
     UploadResponse,
 )
 from db import Db
@@ -104,9 +107,22 @@ async def upload(
     db.update_file_path(job.id, str(file_path))
 
     # Queue for background OCR
-    asyncio.create_task(run_ocr(job.id, str(file_path), doc_type))
+    asyncio.create_task(run_ocr(job.id, str(file_path), id_pdv, doc_type))
 
     return UploadResponse(job_id=job.id, status=JobStatus.PENDING, doc_type=doc_type)
+
+
+# IMPORTANT: declare the static /jobs/pending route BEFORE the parameterized
+# /jobs/{job_id} route. FastAPI/Starlette resolve routes in declaration order
+# and "pending" would otherwise be captured as a job_id, yielding a 404.
+@app.get("/jobs/pending", response_model=JobsPendingResponse)
+def pending_jobs(id_pdv: int = Query(...), limit: int = Query(20, le=100), x_api_key: str = Header(...)):
+    verify_key(x_api_key)
+    jobs = db.list_pending_by_pdv(id_pdv, limit)
+    # Mark as fetched so they don't show up again
+    for job in jobs:
+        db.mark_fetched(job.id)
+    return JobsPendingResponse(jobs=jobs)
 
 
 @app.get("/jobs/{job_id}", response_model=JobDetailResponse)
@@ -118,14 +134,23 @@ def get_job(job_id: str, x_api_key: str = Header(...)):
     return JobDetailResponse(job=job)
 
 
-@app.get("/jobs/pending", response_model=JobsPendingResponse)
-def pending_jobs(id_pdv: int = Query(...), limit: int = Query(20, le=100), x_api_key: str = Header(...)):
+@app.post("/suppliers/sync", response_model=SuppliersSyncResponse)
+def sync_suppliers(
+    payload: SuppliersSyncRequest,
+    id_pdv: int = Query(..., description="Milady PDV ID"),
+    x_api_key: str = Header(...),
+):
+    """Replace the supplier candidates cache for a single PDV.
+
+    The Milady app pushes its `fournisseurs` rows for the user's pdv here so
+    that subsequent OCR jobs for that pdv can fuzzy-match the OCR-extracted
+    supplier_name against real id_f values. Full replacement (not merge) keeps
+    the cache simple and avoids stale entries when suppliers are deleted in
+    Milady.
+    """
     verify_key(x_api_key)
-    jobs = db.list_pending_by_pdv(id_pdv, limit)
-    # Mark as fetched so they don't show up again
-    for job in jobs:
-        db.mark_fetched(job.id)
-    return JobsPendingResponse(jobs=jobs)
+    count = db.replace_supplier_candidates(id_pdv, payload.candidates)
+    return SuppliersSyncResponse(id_pdv=id_pdv, count=count)
 
 
 @app.post("/webhook/email")
@@ -144,14 +169,29 @@ async def email_webhook(request: Request, x_webhook_secret: str = Header(default
         return {"status": "ignored", "reason": "email parsing not yet implemented"}
 
 
-async def run_ocr(job_id: str, file_path: str, doc_type: DocumentType = DocumentType.FACTURE):
+async def run_ocr(
+    job_id: str,
+    file_path: str,
+    id_pdv: Optional[int] = None,
+    doc_type: DocumentType = DocumentType.FACTURE,
+):
     db.mark_processing(job_id)
     try:
-        # TODO: fetch actual supplier candidates (SupplierCandidate) from
-        # Milady fournisseurs scoped by id_pdv. Until then, supplier matching
-        # is a no-op and a warning is appended when supplier_name is read.
-        supplier_candidates = []
+        supplier_candidates: list[SupplierCandidate] = (
+            db.list_supplier_candidates(id_pdv) if id_pdv is not None else []
+        )
         result = ocr_worker.process_file(file_path, supplier_candidates, doc_type=doc_type)
+
+        # When the cache is empty for this pdv we cannot attempt a match;
+        # surface that explicitly so downstream UIs can prompt the operator
+        # to sync suppliers rather than silently dropping the supplier_name.
+        if not supplier_candidates and getattr(result, "supplier_name", ""):
+            result.warnings.append(
+                f"No supplier candidates synced for id_pdv={id_pdv}; "
+                f"supplier matching skipped for '{result.supplier_name}'. "
+                "Call POST /suppliers/sync to seed candidates."
+            )
+
         db.mark_done(job_id, result)
 
         # Optional: auto-webhook to Milady if confidence is high

@@ -12,6 +12,7 @@ from models import (
     JobStatus,
     OcrJob,
     OcrResult,
+    SupplierCandidate,
 )
 
 INIT_SQL = """
@@ -32,6 +33,16 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 CREATE INDEX IF NOT EXISTS idx_jobs_pdv_status ON jobs(id_pdv, status);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+
+CREATE TABLE IF NOT EXISTS supplier_candidates (
+    id_pdv INTEGER NOT NULL,
+    id_f INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (id_pdv, id_f)
+);
+
+CREATE INDEX IF NOT EXISTS idx_supplier_candidates_pdv ON supplier_candidates(id_pdv);
 """
 
 
@@ -140,6 +151,36 @@ class Db:
         with self._connect() as conn:
             conn.execute("UPDATE jobs SET fetched_at = ? WHERE id = ?", (now, job_id))
             conn.commit()
+
+    # ------------------------------------------------------------------
+    # Supplier candidate cache (one row per fournisseur, scoped by id_pdv)
+    # ------------------------------------------------------------------
+
+    def replace_supplier_candidates(
+        self, id_pdv: int, candidates: list[SupplierCandidate]
+    ) -> int:
+        """Atomically swap the cached candidates for this pdv.
+
+        Full replacement (not upsert) means rows deleted in Milady disappear
+        from the cache on the next sync — matching can never pick a stale id_f.
+        """
+        now = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            conn.execute("DELETE FROM supplier_candidates WHERE id_pdv = ?", (id_pdv,))
+            conn.executemany(
+                "INSERT INTO supplier_candidates (id_pdv, id_f, name, updated_at) VALUES (?, ?, ?, ?)",
+                [(id_pdv, c.id_f, c.name, now) for c in candidates],
+            )
+            conn.commit()
+        return len(candidates)
+
+    def list_supplier_candidates(self, id_pdv: int) -> list[SupplierCandidate]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id_f, name FROM supplier_candidates WHERE id_pdv = ? ORDER BY id_f",
+                (id_pdv,),
+            ).fetchall()
+        return [SupplierCandidate(id_f=r["id_f"], name=r["name"]) for r in rows]
 
     def _row_to_job(self, row: sqlite3.Row) -> OcrJob:
         # Resolve doc_type defensively — legacy rows may have NULL.

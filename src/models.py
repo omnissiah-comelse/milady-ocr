@@ -115,3 +115,20 @@ class JobsPendingResponse(BaseModel):
 
 class JobDetailResponse(BaseModel):
     job: OcrJob
+
+
+# ---------- Supplier candidate sync (Milady -> sidecar) ----------
+
+class SuppliersSyncRequest(BaseModel):
+    """Body for POST /suppliers/sync.
+
+    Milady pushes its `fournisseurs` rows for one pdv. The sidecar replaces
+    (not merges) the local cache so that deletions/renames in Milady are
+    reflected. The list can be empty to clear the cache for that pdv.
+    """
+    candidates: list[SupplierCandidate] = Field(default_factory=list)
+
+
+class SuppliersSyncResponse(BaseModel):
+    id_pdv: int
+    count: int

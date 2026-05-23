@@ -29,8 +29,9 @@ Two document types are supported (COM-606):
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | /upload | Upload PDF/image. Accepts `doc_type=facture\|commande` (default `facture`). Returns `job_id`. |
+| GET | /jobs/pending | Long-poll for pending jobs by PDV (declared **before** `/jobs/{job_id}` so the static path is not shadowed) |
 | GET | /jobs/{job_id} | Check OCR status + result |
-| GET | /jobs/pending | Long-poll for pending jobs by PDV |
+| POST | /suppliers/sync | Replace the supplier-candidate cache for a single PDV (see below) |
 | POST | /webhook/email | Receive forwarded invoice/order emails |
 | GET | /health | Health check |
 
@@ -92,6 +93,27 @@ candidates = [
 
 The matched `id_f` corresponds directly to `fournisseurs.id_f` in Milady, not a list-position hack. The legacy `list[str]` form is still accepted for backward compatibility (id is derived from the 1-based list index — only safe in test fixtures or single-supplier setups).
 
+### `POST /suppliers/sync`
+
+The Milady app pushes the current `fournisseurs` rows for one pdv into a small SQLite cache (`supplier_candidates`) so that the OCR job triggered by a later `/upload` can fuzzy-match the extracted `supplier_name`. The endpoint is **replace, not merge** — pushing an empty list clears the cache for that pdv, and rows deleted in Milady disappear on the next sync.
+
+```http
+POST /suppliers/sync?id_pdv=5
+x-api-key: <key>
+Content-Type: application/json
+
+{
+  "candidates": [
+    {"id_f": 17, "name": "Boulangerie Durand"},
+    {"id_f": 23, "name": "Grossiste Martin"}
+  ]
+}
+```
+
+Response: `{"id_pdv": 5, "count": 2}`.
+
+If `/upload?doc_type=...` is processed for a pdv whose cache is empty, the resulting job carries an explicit warning ("No supplier candidates synced for id_pdv=X; …") so the UI can prompt for a sync instead of silently dropping the supplier_name. Milady's recommended pattern is to call `/suppliers/sync` opportunistically when the operator opens `fact-form.php` or `cmd-form.php`.
+
 ## Integration with Milady
 
 ```php
@@ -122,3 +144,11 @@ Tests do **not** call OpenAI, do **not** require Poppler, and do **not** depend 
 ## Calibration limitation (COM-606)
 
 This checkout intentionally ships **without** anonymized Mercalys order samples. The prompt was authored from the field spec in the COM-606 ticket and post-meeting notes. Real prompt calibration — adjusting the system prompt, confidence thresholds, and per-field warning heuristics against 20–50 anonymized Mercalys PDFs — must happen in a subsequent pass, once Julien has assembled and anonymized the sample set. The unit tests cover parsing/persistence/matching behavior, not OCR accuracy.
+
+A harness is provided at `scripts/calibrate_commande.py`. It expects a local directory of anonymized samples (PDFs paired with `*.expected.json` ground truth) and prints per-field accuracy plus a list of mismatches. **Do not commit the sample directory or any client documents** — `.gitignore` already excludes `data/`, and this repo must remain free of raw scanned PDFs.
+
+```bash
+OPENAI_API_KEY=... PYTHONPATH=src python3 scripts/calibrate_commande.py /path/to/samples/
+```
+
+Until that sample set exists, **calibration is pending and no accuracy numbers should be reported to QA**.

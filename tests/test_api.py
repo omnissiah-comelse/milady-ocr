@@ -173,3 +173,108 @@ def test_invalid_api_key_rejected(app_module):
         headers={"x-api-key": "wrong"},
     )
     assert r.status_code == 401
+
+
+def test_jobs_pending_static_route_not_shadowed(app_module):
+    """Regression for COM-606 QA blocker #1: the static /jobs/pending route
+    must resolve before /jobs/{job_id}, otherwise "pending" is captured as a
+    job_id and the endpoint 404s.
+    """
+    client = TestClient(app_module.app)
+
+    body = _upload(client, doc_type="commande").json()
+    _wait_done(client, body["job_id"])  # ensure at least one done job exists for pdv=5
+
+    r = client.get("/jobs/pending", params={"id_pdv": 5}, headers={"x-api-key": "test-key"})
+    assert r.status_code == 200, r.text
+    payload = r.json()
+    assert "jobs" in payload
+    assert any(j["id"] == body["job_id"] for j in payload["jobs"])
+    # Second call returns nothing — first call already marked the job fetched.
+    r2 = client.get("/jobs/pending", params={"id_pdv": 5}, headers={"x-api-key": "test-key"})
+    assert r2.status_code == 200
+    assert all(j["id"] != body["job_id"] for j in r2.json()["jobs"])
+
+
+def test_suppliers_sync_persists_for_pdv(app_module):
+    client = TestClient(app_module.app)
+    r = client.post(
+        "/suppliers/sync",
+        params={"id_pdv": 5},
+        json={"candidates": [
+            {"id_f": 17, "name": "Boulangerie Durand"},
+            {"id_f": 23, "name": "Grossiste Martin"},
+        ]},
+        headers={"x-api-key": "test-key"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body == {"id_pdv": 5, "count": 2}
+
+    # The cache must be scoped per pdv: another pdv sees nothing.
+    assert app_module.db.list_supplier_candidates(5)[0].id_f == 17
+    assert app_module.db.list_supplier_candidates(999) == []
+
+
+def test_suppliers_sync_replaces_not_merges(app_module):
+    client = TestClient(app_module.app)
+    headers = {"x-api-key": "test-key"}
+
+    client.post(
+        "/suppliers/sync",
+        params={"id_pdv": 5},
+        json={"candidates": [{"id_f": 17, "name": "Boulangerie Durand"}]},
+        headers=headers,
+    )
+    # Replace with a different list — old id_f=17 must be gone.
+    client.post(
+        "/suppliers/sync",
+        params={"id_pdv": 5},
+        json={"candidates": [{"id_f": 42, "name": "Nouveau Fournisseur"}]},
+        headers=headers,
+    )
+    candidates = app_module.db.list_supplier_candidates(5)
+    assert [c.id_f for c in candidates] == [42]
+
+
+def test_full_flow_supplier_match_after_sync(app_module):
+    """COM-606 QA blocker #2: POST /upload?doc_type=commande followed by
+    GET /jobs/{job_id} must exercise supplier matching when candidates are
+    seeded for the id_pdv. BOULANGERIE DURAND must match id_f=17.
+    """
+    client = TestClient(app_module.app)
+
+    sync = client.post(
+        "/suppliers/sync",
+        params={"id_pdv": 5},
+        json={"candidates": [
+            {"id_f": 17, "name": "Boulangerie Durand"},
+            {"id_f": 23, "name": "Grossiste Martin"},
+        ]},
+        headers={"x-api-key": "test-key"},
+    )
+    assert sync.status_code == 200
+
+    body = _upload(client, doc_type="commande").json()
+    job = _wait_done(client, body["job_id"])
+    assert job["status"] == "done"
+    cmd = job["commande_result"]
+    assert cmd["supplier_match"]["id_f"] == 17
+    assert cmd["supplier_match"]["name"] == "Boulangerie Durand"
+    assert cmd["supplier_match"]["score"] is not None and cmd["supplier_match"]["score"] > 0.6
+    # No "no candidates synced" warning since the cache had entries.
+    assert not any("No supplier candidates synced" in w for w in cmd["warnings"])
+
+
+def test_warning_emitted_when_no_candidates_for_pdv(app_module):
+    """COM-606 QA blocker #3 follow-up: when nothing has been synced for the
+    pdv but OCR extracted a supplier_name, the result must carry an explicit
+    warning rather than a silent all-null supplier_match.
+    """
+    client = TestClient(app_module.app)
+    # Note: NO /suppliers/sync call.
+    body = _upload(client, doc_type="commande").json()
+    job = _wait_done(client, body["job_id"])
+    cmd = job["commande_result"]
+    assert cmd["supplier_match"]["id_f"] is None
+    assert any("No supplier candidates synced" in w for w in cmd["warnings"])
