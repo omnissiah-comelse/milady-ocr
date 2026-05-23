@@ -2,12 +2,22 @@ import os
 import asyncio
 from pathlib import Path
 from contextlib import asynccontextmanager
+from typing import Union
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Header, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic_settings import BaseSettings
 
-from models import UploadResponse, JobsPendingResponse, JobDetailResponse, OcrJob, JobStatus
+from models import (
+    CommandeOcrResult,
+    DocumentType,
+    JobDetailResponse,
+    JobStatus,
+    JobsPendingResponse,
+    OcrJob,
+    OcrResult,
+    UploadResponse,
+)
 from db import Db
 from ocr import OcrWorker
 
@@ -60,6 +70,10 @@ def health():
 async def upload(
     file: UploadFile = File(...),
     id_pdv: int = Query(..., description="Milady PDV ID"),
+    doc_type: DocumentType = Query(
+        DocumentType.FACTURE,
+        description="Document type: 'facture' (default, invoice) or 'commande' (Mercalys order)",
+    ),
     _=Header(..., alias="x-api-key"),
 ):
     verify_key(_)
@@ -73,18 +87,26 @@ async def upload(
         raise HTTPException(status_code=413, detail=f"File too large (max {settings.max_file_size_mb}MB)")
 
     ext = Path(file.filename).suffix or ".bin"
-    job = db.create_job(id_pdv=id_pdv, filename=file.filename, mime_type=file.content_type, file_path="")
+    job = db.create_job(
+        id_pdv=id_pdv,
+        filename=file.filename,
+        mime_type=file.content_type,
+        file_path="",
+        doc_type=doc_type,
+    )
 
-    file_path = Path(settings.upload_dir) / f"{job.id}{ext}"
+    upload_dir = Path(settings.upload_dir)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    file_path = upload_dir / f"{job.id}{ext}"
     with open(file_path, "wb") as f:
         f.write(contents)
 
     db.update_file_path(job.id, str(file_path))
 
     # Queue for background OCR
-    asyncio.create_task(run_ocr(job.id, str(file_path)))
+    asyncio.create_task(run_ocr(job.id, str(file_path), doc_type))
 
-    return UploadResponse(job_id=job.id, status=JobStatus.PENDING)
+    return UploadResponse(job_id=job.id, status=JobStatus.PENDING, doc_type=doc_type)
 
 
 @app.get("/jobs/{job_id}", response_model=JobDetailResponse)
@@ -122,28 +144,38 @@ async def email_webhook(request: Request, x_webhook_secret: str = Header(default
         return {"status": "ignored", "reason": "email parsing not yet implemented"}
 
 
-async def run_ocr(job_id: str, file_path: str):
+async def run_ocr(job_id: str, file_path: str, doc_type: DocumentType = DocumentType.FACTURE):
     db.mark_processing(job_id)
     try:
-        # TODO: fetch actual supplier names from Milady DB or cache
-        supplier_names = []
-        result = ocr_worker.process_file(file_path, supplier_names)
+        # TODO: fetch actual supplier candidates (SupplierCandidate) from
+        # Milady fournisseurs scoped by id_pdv. Until then, supplier matching
+        # is a no-op and a warning is appended when supplier_name is read.
+        supplier_candidates = []
+        result = ocr_worker.process_file(file_path, supplier_candidates, doc_type=doc_type)
         db.mark_done(job_id, result)
 
         # Optional: auto-webhook to Milady if confidence is high
         if result.confidence >= settings.ocr_confidence_threshold and settings.milady_webhook_url:
-            await notify_milady(job_id, result)
+            await notify_milady(job_id, result, doc_type)
     except Exception as e:
         db.mark_error(job_id, str(e))
 
 
-async def notify_milady(job_id: str, result):
+async def notify_milady(
+    job_id: str,
+    result: Union[OcrResult, CommandeOcrResult],
+    doc_type: DocumentType = DocumentType.FACTURE,
+):
     import httpx
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             await client.post(
                 settings.milady_webhook_url,
-                json={"job_id": job_id, "ocr_result": result.model_dump()},
+                json={
+                    "job_id": job_id,
+                    "doc_type": doc_type.value,
+                    "ocr_result": result.model_dump(),
+                },
                 headers={"x-webhook-key": settings.milady_webhook_key},
             )
     except Exception:

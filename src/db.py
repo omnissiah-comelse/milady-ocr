@@ -4,14 +4,21 @@ import json
 from datetime import datetime
 from pathlib import Path
 from contextlib import contextmanager
-from typing import Optional
+from typing import Optional, Union
 
-from models import OcrJob, JobStatus, OcrResult, OcrLineItem
+from models import (
+    CommandeOcrResult,
+    DocumentType,
+    JobStatus,
+    OcrJob,
+    OcrResult,
+)
 
 INIT_SQL = """
 CREATE TABLE IF NOT EXISTS jobs (
     id TEXT PRIMARY KEY,
     id_pdv INTEGER,
+    doc_type TEXT NOT NULL DEFAULT 'facture',
     status TEXT NOT NULL DEFAULT 'pending',
     filename TEXT NOT NULL,
     mime_type TEXT NOT NULL,
@@ -46,15 +53,40 @@ class Db:
     def _init_db(self):
         with self._connect() as conn:
             conn.executescript(INIT_SQL)
+            # Best-effort additive migration for pre-COM-606 databases that
+            # were created without a doc_type column. ALTER TABLE ADD COLUMN
+            # is idempotent enough when guarded by a PRAGMA check.
+            cols = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+            if "doc_type" not in cols:
+                conn.execute(
+                    "ALTER TABLE jobs ADD COLUMN doc_type TEXT NOT NULL DEFAULT 'facture'"
+                )
             conn.commit()
 
-    def create_job(self, id_pdv: Optional[int], filename: str, mime_type: str, file_path: str) -> OcrJob:
+    def create_job(
+        self,
+        id_pdv: Optional[int],
+        filename: str,
+        mime_type: str,
+        file_path: str,
+        doc_type: DocumentType = DocumentType.FACTURE,
+    ) -> OcrJob:
         job_id = str(uuid.uuid4())
         now = datetime.utcnow().isoformat()
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO jobs (id, id_pdv, status, filename, mime_type, file_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (job_id, id_pdv, JobStatus.PENDING.value, filename, mime_type, file_path, now, now)
+                "INSERT INTO jobs (id, id_pdv, doc_type, status, filename, mime_type, file_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    job_id,
+                    id_pdv,
+                    doc_type.value,
+                    JobStatus.PENDING.value,
+                    filename,
+                    mime_type,
+                    file_path,
+                    now,
+                    now,
+                ),
             )
             conn.commit()
         return self.get_job(job_id)
@@ -80,7 +112,7 @@ class Db:
             conn.execute("UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?", (JobStatus.PROCESSING.value, now, job_id))
             conn.commit()
 
-    def mark_done(self, job_id: str, result: OcrResult):
+    def mark_done(self, job_id: str, result: Union[OcrResult, CommandeOcrResult]):
         now = datetime.utcnow().isoformat()
         with self._connect() as conn:
             conn.execute(
@@ -110,20 +142,33 @@ class Db:
             conn.commit()
 
     def _row_to_job(self, row: sqlite3.Row) -> OcrJob:
-        ocr_result = None
+        # Resolve doc_type defensively — legacy rows may have NULL.
+        try:
+            doc_type_raw = row["doc_type"] if "doc_type" in row.keys() else None
+        except IndexError:
+            doc_type_raw = None
+        doc_type = DocumentType(doc_type_raw) if doc_type_raw else DocumentType.FACTURE
+
+        ocr_result: Optional[OcrResult] = None
+        commande_result: Optional[CommandeOcrResult] = None
         if row["ocr_result_json"]:
             try:
                 data = json.loads(row["ocr_result_json"])
-                ocr_result = OcrResult(**data)
+                if doc_type == DocumentType.COMMANDE:
+                    commande_result = CommandeOcrResult(**data)
+                else:
+                    ocr_result = OcrResult(**data)
             except Exception:
                 pass
         return OcrJob(
             id=row["id"],
             id_pdv=row["id_pdv"],
+            doc_type=doc_type,
             status=JobStatus(row["status"]),
             filename=row["filename"],
             mime_type=row["mime_type"],
             ocr_result=ocr_result,
+            commande_result=commande_result,
             error_message=row["error_message"],
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
